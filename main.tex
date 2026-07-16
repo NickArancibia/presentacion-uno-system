@@ -50,7 +50,7 @@
 }
 
 \title{Arquitectura de microservicios}
-\subtitle{UnoArena --- defensa final}
+\subtitle{UnoArena}
 \author{Grupo 5}
 \date{}
 
@@ -74,7 +74,6 @@
       \begin{itemize}
         \item Hasta \alert{1.000.000} de jugadores por torneo
         \item Ronda 1 $\Rightarrow$ \alert{$\sim$100.000 salas simultáneas}
-        \item Espectadores 10:1 $\Rightarrow$ $\sim$11 M conexiones WS
       \end{itemize}
   \end{columns}
   \vfill
@@ -140,134 +139,23 @@
     \column{0.55\textwidth}
       \begin{itemize}
         \item \textbf{Room Gameplay}: núcleo write-heavy, row-lock por juego
-        \item \textbf{Tournament}: orquestación Bo3, otro vocabulario\\
+        \item \textbf{Tournament}: orquestación Bo3\\
               {\scriptsize (``forfeit'' $=$ eliminación permanente, no salir del juego)}
-        \item \textbf{Ranking}: única autoridad de Elo, reversión auditada
+        \item \textbf{Ranking}: única autoridad de Elo
         \item \textbf{Spectator}: proyección read-only + \alert{ACL de privacidad}
         \item \textbf{Identity}: sesión única, upstream de todos
         \item \textbf{Moderation}: audit-log, comandos correctivos
-        \item \textbf{Analytics}: diseñado, \alert{no desplegado} (ADR-009)
       \end{itemize}
     \column{0.42\textwidth}
       \textbf{Lo que evaluamos y descartamos}
       \begin{itemize}
-        \item BFF de juego separado del gateway \\
-              {\scriptsize $\to$ duplica JWT, rate limit e invalidación (ADR-007)}
         \item Matchmaking como servicio propio \\
               {\scriptsize $\to$ cada modo ya tiene dueño natural}
-        \item Plegar Analytics en Ranking \\
-              {\scriptsize $\to$ erosiona la frontera de autoridad}
       \end{itemize}
   \end{columns}
   \vfill
   \centering\scriptsize\color{cGrey}
   Cada contexto tiene consistencia y ciclo de vida de datos distintos $\Rightarrow$ sin base compartida.
-\end{frame}
-
-% ============================================================
-\begin{frame}{Flujo completo: jugar una carta}
-  \begin{center}
-  \begin{tikzpicture}
-    % --- carril síncrono ---
-    \node[infra] (cli) at (0,0) {CLI};
-    \node[svc] (gw) at (3.0,0) {api-gateway};
-    \node[svc, fill=cGame!25] (rg) at (6.6,0) {room-gameplay};
-    \node[pg, align=left] (tx) at (10.6,0)
-      {\textbf{1 transacción PG}\\[-1pt]
-       {\tiny estado (\texttt{state\_version}++)}\\[-2pt]
-       {\tiny \texttt{game\_events} (log) + \texttt{outbox}}};
-    \draw[flecha] (cli) -- (gw) node[midway, above=0.5mm, lbl] {\circledpaso{1} frame WS};
-    \draw[flecha] (gw) -- (rg) node[midway, above=0.5mm, lbl] {\circledpaso{2} HTTP POST};
-    \draw[flecha] (rg) -- (tx) node[midway, above=0.5mm, lbl] {\circledpaso{3}};
-    \draw[flecha, dashed, cGrey] (rg.south) to[bend left=15]
-      node[midway, below=0.5mm, lbl] {\circledpaso{4} 200 OK $\to$ push WS a toda la sala}
-      (cli.south);
-    % --- carril asíncrono ---
-    \node[kafka, minimum width=56mm] (kf) at (6.6,-2.3)
-      {\texttt{game-events} \; · \; key $=$ \texttt{game\_id} \; · \; at-least-once};
-    \draw[flecha] (tx.south) |- node[pos=0.22, right=0.7mm, lbl] {\circledpaso{5} relay outbox} (kf.east);
-    \node[svc] (ra) at (2.2,-4.0) {ranking\\[-2pt]{\tiny Elo}};
-    \node[svc] (to) at (5.2,-4.0) {tournament\\[-2pt]{\tiny match Bo3}};
-    \node[svc] (mo) at (8.2,-4.0) {moderation};
-    \node[redis] (sp) at (12.0,-4.0) {spectator\\[-2pt]{\tiny filtro privacidad $\to$ Streams $\to$ espectadores}};
-    \draw[flecha] (kf.south -| ra) -- (ra.north)
-      node[midway, left=0.5mm, lbl] {\circledpaso{6} consumer groups independientes};
-    \draw[flecha] (kf.south -| to) -- (to.north);
-    \draw[flecha] (kf.south -| mo) -- (mo.north);
-    \draw[flecha] ([xshift=24mm]kf.south) |- (sp.west);
-  \end{tikzpicture}
-  \end{center}
-  \vspace{1mm}
-  \begin{itemize}\scriptsize
-    \item El jugador ve su resultado \textbf{después del COMMIT, sin esperar a Kafka} $\to$ hot path $<$ 100 ms (P99 $<$ 200 ms).
-    \item WebSocket y no SSE/polling: full-duplex en 1 conexión y \emph{close frame} server-side para la sesión única (ADR-001).
-    \item Conflicto de versión $\Rightarrow$ \texttt{409 stale\_state\_version} + reconciliación por el log --- concurrencia optimista, sin locks distribuidos.
-  \end{itemize}
-\end{frame}
-
-% ============================================================
-\begin{frame}{Decisión: outbox transaccional (log-before-broadcast)}
-  \textbf{Regla}: nadie observa un cambio de estado antes de que esté en el log durable.
-  \vspace{2mm}
-  \begin{columns}[T]
-    \column{0.52\textwidth}
-      \begin{center}
-      \begin{tikzpicture}[node distance=3.5mm]
-        \node[pg, minimum width=46mm, align=left] (tx)
-          {\textbf{BEGIN} \; {\tiny(row-lock por \texttt{game\_id})}\\[-1pt]
-           {\scriptsize estado + \texttt{game\_events} + \texttt{outbox}}\\[-1pt]
-           \textbf{COMMIT}};
-        \node[svc, below=of tx, minimum width=46mm] (rel)
-          {relay embebido {\tiny(\texttt{FOR UPDATE SKIP LOCKED})}};
-        \node[kafka, below=of rel, minimum width=46mm] (kf)
-          {Kafka {\tiny(\texttt{enable.idempotence}, \texttt{acks=all})}};
-        \draw[flecha] (tx) -- (rel);
-        \draw[flecha] (rel) -- (kf);
-      \end{tikzpicture}
-      \end{center}
-    \column{0.44\textwidth}
-      \textbf{Alternativas evaluadas}
-      \begin{itemize}
-        \item[\textcolor{cRedis}{\ding{55}}] \textbf{Dual-write} DB $+$ Kafka:\\
-              {\scriptsize crash entre escrituras $=$ evento perdido o broadcast falso}
-        \item[\textcolor{cRedis}{\ding{55}}] \textbf{Event sourcing} puro:\\
-              {\scriptsize rehidratar 400--1000 eventos por comando $=$ latencia}
-        \item[\textcolor{cPG}{\ding{51}}] \textbf{Outbox}: atomicidad gratis,\\
-              {\scriptsize estado JSONB $\to$ comando O(1)}
-      \end{itemize}
-  \end{columns}
-  \vfill
-  \centering\scriptsize\color{cGrey}
-  El \texttt{traceparent} del comando viaja \emph{dentro de la fila de outbox} $\to$ la traza cruza Kafka (se ve en Jaeger).
-\end{frame}
-
-% ============================================================
-\begin{frame}{Decisión: Kafka como backbone --- tópicos, keys y particiones}
-  \small
-  \textbf{¿Por qué Kafka?} Consumer groups con lag independiente (aislar el burst),
-  orden por partición, replay durable. RabbitMQ: sin fan-out con lag propio ni replay.
-  Redis Streams: sin partition routing, memoria acotada.
-  \vspace{2mm}
-  \begin{center}\scriptsize
-  \begin{tabular}{@{}llll@{}}
-    \toprule
-    Tópico & Partition key & Particiones (diseño / demo) & La key es la unidad de orden de\ldots \\
-    \midrule
-    \texttt{game-events}        & \texttt{game\_id}       & \alert{100+} / 8 & cada partida (spectator, torneo) \\
-    \texttt{tournament-kickoff} & \texttt{room\_id}       & \alert{100+} / 8 & fan-out del surge \\
-    \texttt{tournament-events}  & \texttt{tournament\_id} & 20 / 3  & el bracket \\
-    \texttt{identity-events}    & \texttt{player\_id}     & 20 / 3  & la sesión de un jugador \\
-    \texttt{ranking-events}     & \texttt{player\_id}     & 20 / 3  & el Elo de un jugador \\
-    \texttt{moderation-events}  & \texttt{player\_id}/\texttt{game\_id} & 10 / 3 & el sujeto del evento \\
-    \bottomrule
-  \end{tabular}
-  \end{center}
-  \vspace{2mm}
-  \begin{itemize}\scriptsize
-    \item El tipo de evento va como \textbf{header}, no en la key ni en tópicos por tipo.
-    \item \texttt{game-events} domina ($\sim$300 K ev/s pico) $\to$ se lleva las particiones; consumers escalan hasta ese límite.
-    \item Demo $=$ scale-down documentado: misma semántica, un broker.
-  \end{itemize}
 \end{frame}
 
 % ============================================================
@@ -320,12 +208,137 @@
   \vspace{2mm}
   \begin{itemize}\small
     \item \texttt{finish\_timestamp} con \textbf{reloj monotónico del server}; sin podio $\Rightarrow$ contribuye el timeout de 20 min.
-    \item La semilla del RNG sale del match y queda registrada en \texttt{MatchCompleted}.
     \item Forfeits: \textbf{debajo de todos los activos}, siempre. Sala con $\le$3 activos $\Rightarrow$ avanzan todos.
   \end{itemize}
-  \vfill
-  \centering\scriptsize\color{cGrey}
-  Cada criterio mide algo más fino y siempre disponible: resultado $\to$ calidad $\to$ velocidad $\to$ azar auditable.
+\end{frame}
+
+% ============================================================
+\begin{frame}{Decisión: un único API Gateway como frontera pública}
+  \vspace{-1mm}
+  \begin{columns}[T]
+    \column{0.51\textwidth}
+      \textbf{\small Qué hace} {\scriptsize --- políticas, nunca lógica de dominio}
+      \begin{itemize}\scriptsize
+        \item \textbf{TLS} y upgrade WS; único componente con interfaz pública
+        \item \textbf{JWT}: firma verificada local $+$ cache-aside
+        \item \textbf{Rate limiting}: \texttt{INCR} por IP $+$ ZSET sliding por usuario
+        \item \textbf{Fan-out de sala}: registro \texttt{player\_id} $\to$ WS; el \texttt{200 OK} trae \texttt{notify\_player\_ids}
+      \end{itemize}
+    \column{0.45\textwidth}
+      \textbf{\small Alternativas evaluadas}
+      \begin{itemize}\scriptsize
+        \item[\textcolor{cRedis}{\ding{55}}] \textbf{Sin gateway}, cliente $\to$ cada servicio
+        \item[\textcolor{cPG}{\ding{51}}] \textbf{Un gateway, tres públicos}\\ {\tiny (jugador WS · espectador WS · REST): registro unificado $\Rightarrow$ el close frame alcanza \emph{todas} las conexiones del jugador}
+      \end{itemize}
+      \vspace{1mm}
+      \textbf{\small Trade-offs aceptados}
+      \begin{itemize}\scriptsize
+        \item Registro \textbf{in-memory por pod} $\Rightarrow$ sticky routing por \texttt{game\_id}; pod caído $=$ reconexión\\
+              {\tiny el estado vive en PG y Redis, no en el gateway}
+        \item Entrega con \alert{1 réplica}: \texttt{/internal/push} caería en un pod al azar\\
+              {\tiny remediación documentada: fan-out por Redis Pub/Sub}
+      \end{itemize}
+  \end{columns}
+\end{frame}
+
+% ============================================================
+\begin{frame}{Flujo completo: jugar una carta}
+  \begin{center}
+  \begin{tikzpicture}
+    % --- carril síncrono ---
+    \node[infra] (cli) at (0,0) {CLI};
+    \node[svc] (gw) at (3.0,0) {api-gateway};
+    \node[svc, fill=cGame!25] (rg) at (6.6,0) {room-gameplay};
+    \node[pg, align=left] (tx) at (10.6,0)
+      {\textbf{1 transacción PG}\\[-1pt]
+       {\tiny estado (\texttt{state\_version}++)}\\[-2pt]
+       {\tiny \texttt{game\_events} (log) + \texttt{outbox}}};
+    \draw[flecha] (cli) -- (gw) node[midway, above=0.5mm, lbl] {\circledpaso{1} frame WS};
+    \draw[flecha] (gw) -- (rg) node[midway, above=0.5mm, lbl] {\circledpaso{2} HTTP POST};
+    \draw[flecha] (rg) -- (tx) node[midway, above=0.5mm, lbl] {\circledpaso{3}};
+    \draw[flecha, dashed, cGrey] (rg.south) to[bend left=18]
+      node[midway, below=0.5mm, lbl] {\circledpaso{4} 200 OK $+$ \texttt{notify\_player\_ids}}
+      (gw.south);
+    \draw[flecha, dashed, cGrey] (gw.south) to[bend left=18]
+      node[midway, below=0.5mm, lbl] {push WS a toda la sala}
+      (cli.south);
+    % --- carril asíncrono ---
+    \node[kafka, minimum width=108mm] (kf) at (6.9,-2.3)
+      {\texttt{game-events} \; · \; key $=$ \texttt{game\_id} \; · \; at-least-once};
+    \draw[flecha] (tx.south) -- node[midway, right=0.7mm, lbl] {\circledpaso{5} relay outbox}
+      (tx.south |- kf.north);
+    \node[svc] (ra) at (2.2,-4.0) {ranking\\[-2pt]{\tiny Elo}};
+    \node[svc] (to) at (5.2,-4.0) {tournament\\[-2pt]{\tiny match Bo3}};
+    \node[svc] (mo) at (8.2,-4.0) {moderation};
+    \node[redis] (sp) at (11.8,-4.0) {spectator\\[-2pt]{\tiny filtro privacidad $\to$ Streams $\to$ espectadores}};
+    \draw[flecha] (kf.south -| ra) -- (ra.north)
+      node[midway, left=0.5mm, lbl] {\circledpaso{6} consumer groups independientes};
+    \draw[flecha] (kf.south -| to) -- (to.north);
+    \draw[flecha] (kf.south -| mo) -- (mo.north);
+    \draw[flecha] (kf.south -| sp) -- (sp.north);
+  \end{tikzpicture}
+  \end{center}
+  \vspace{1mm}
+  \begin{itemize}\scriptsize
+    \item El jugador ve su resultado \textbf{después del COMMIT, sin esperar a Kafka} $\to$ hot path $<$ 100 ms (P99 $<$ 200 ms).
+    \item WebSocket y no SSE/polling: full-duplex en 1 conexión y \emph{close frame} server-side para la sesión única.
+  \end{itemize}
+\end{frame}
+
+% ============================================================
+\begin{frame}{Decisión: outbox transaccional (log-before-broadcast)}
+  \textbf{Regla}: nadie observa un cambio de estado antes de que esté en el log durable.
+  \vspace{2mm}
+  \begin{columns}[T]
+    \column{0.52\textwidth}
+      \begin{center}
+      \begin{tikzpicture}[node distance=3.5mm]
+        \node[pg, minimum width=46mm, align=left] (tx)
+          {\textbf{BEGIN} \; {\tiny(row-lock por \texttt{game\_id})}\\[-1pt]
+           {\scriptsize estado + \texttt{game\_events} + \texttt{outbox}}\\[-1pt]
+           \textbf{COMMIT}};
+        \node[svc, below=of tx, minimum width=46mm] (rel)
+          {relay embebido {\tiny(\texttt{FOR UPDATE SKIP LOCKED})}};
+        \node[kafka, below=of rel, minimum width=46mm] (kf)
+          {Kafka {\tiny(\texttt{enable.idempotence}, \texttt{acks=all})}};
+        \draw[flecha] (tx) -- (rel);
+        \draw[flecha] (rel) -- (kf);
+      \end{tikzpicture}
+      \end{center}
+    \column{0.44\textwidth}
+      \textbf{Alternativas evaluadas}
+      \begin{itemize}
+        \item[\textcolor{cRedis}{\ding{55}}] \textbf{Dual-write} DB $+$ Kafka:\\
+              {\scriptsize crash entre escrituras $=$ evento perdido o broadcast falso}
+        \item[\textcolor{cRedis}{\ding{55}}] \textbf{Event sourcing} puro:\\
+              {\scriptsize rehidratar 400--1000 eventos por comando $=$ latencia}
+        \item[\textcolor{cPG}{\ding{51}}] \textbf{Outbox}: atomicidad gratis,\\
+              {\scriptsize estado JSONB $\to$ comando O(1)}
+      \end{itemize}
+  \end{columns}
+\end{frame}
+
+% ============================================================
+\begin{frame}{Decisión: Kafka como backbone --- tópicos, keys y particiones}
+  \small
+  \textbf{¿Por qué Kafka?} Consumer groups con lag independiente (aislar el burst),
+  orden por partición, replay durable. RabbitMQ: sin fan-out con lag propio ni replay.
+  Redis Streams: sin partition routing, memoria acotada.
+  \vspace{2mm}
+  \begin{center}\scriptsize
+  \begin{tabular}{@{}llll@{}}
+    \toprule
+    Tópico & Partition key & Particiones (diseño / demo) & La key es la unidad de orden de\ldots \\
+    \midrule
+    \texttt{game-events}        & \texttt{game\_id}       & \alert{100+} / 8 & cada partida (spectator, torneo) \\
+    \texttt{tournament-kickoff} & \texttt{room\_id}       & \alert{100+} / 8 & fan-out del surge \\
+    \texttt{tournament-events}  & \texttt{tournament\_id} & 20 / 3  & el bracket \\
+    \texttt{identity-events}    & \texttt{player\_id}     & 20 / 3  & la sesión de un jugador \\
+    \texttt{ranking-events}     & \texttt{player\_id}     & 20 / 3  & el Elo de un jugador \\
+    \texttt{moderation-events}  & \texttt{player\_id}/\texttt{game\_id} & 10 / 3 & el sujeto del evento \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
 \end{frame}
 
 % ============================================================
@@ -356,7 +369,6 @@
       \begin{itemize}\scriptsize
         \item[\textcolor{cRedis}{\ding{55}}] in-process: no sobrevive un crash
         \item[\textcolor{cRedis}{\ding{55}}] tabla PG + polling: 1 s de jitter en una ventana de 5 s
-        \item[\textcolor{cRedis}{\ding{55}}] Kafka diferido: sin delay nativo, cancelar es complejo
         \item[\textcolor{cPG}{\ding{51}}] Redis TTL: precisión ms, crash-safe, cancelación O(1)
       \end{itemize}
       \vspace{1mm}
@@ -404,40 +416,12 @@
 \end{frame}
 
 % ============================================================
-\begin{frame}{Alcance honesto: qué corre y qué no}
-  \small
-  \begin{itemize}
-    \item \textbf{analytics-service no desplegado} (ADR-009):
-      el burst ya lo absorben 4 consumer groups independientes; sus read models
-      duplican ranking / tournament / spectator.\\
-      {\scriptsize Alternativas evaluadas: implementarlo completo \ding{55} · versión token \ding{55} · plegarlo en ranking \ding{55}.
-      Pérdida real declarada: stats históricas por jugador.}
-    \item \textbf{outbox-relay embebido} en cada servicio: ahí vive la frontera transaccional.
-    \item \textbf{api-gateway con 1 réplica}: registro de WS in-process;
-      remediación documentada $=$ fan-out Redis Pub/Sub (el mismo mecanismo de la invalidación de sesión).
-    \item \textbf{Nodo único}: 1 Postgres (7 schemas, no $\times$16 shards), 1 broker ---
-      scale-down documentado, mismos code paths y contratos.
-  \end{itemize}
+\begin{frame}{Observabilidad: 6 métricas de negocio}
   \vfill
-  \centering\scriptsize\color{cGrey}
-  Decisiones registradas en ADRs, no trabajo inconcluso.
-\end{frame}
-
-% ============================================================
-\begin{frame}{Observabilidad: RED + 6 métricas de negocio}
-  \begin{columns}[T]
-    \column{0.46\textwidth}
-      \textbf{\small Tres pilares, desplegados}
-      \begin{itemize}\small
-        \item \textbf{Prometheus}: RED por servicio (P99 $<$ 200 ms)
-        \item \textbf{Grafana}: dashboard \emph{UnoArena --- Live}, provisionado como código
-        \item \textbf{Jaeger}: la traza \alert{cruza Kafka} vía \texttt{traceparent} en la fila de outbox
-      \end{itemize}
-      \vspace{1mm}
-      {\scriptsize Logs JSON estructurados con \texttt{correlation\_id} \\ a través de HTTP, WS y headers Kafka.}
-    \column{0.5\textwidth}
+  \begin{center}
+    \begin{minipage}{0.78\textwidth}
       \textbf{\small Métricas de negocio (se piden 3, hay 6)}
-      \begin{itemize}\scriptsize
+      \begin{itemize}\small
         \item \texttt{uno\_game\_events\_total} --- 1 hook en el log $=$ todo el dominio
         \item \texttt{uno\_games\_active} --- gauge que se auto-repara (lee PG)
         \item \texttt{uno\_matchmaking\_queue\_depth} --- sube y cae a 0 al formar sala
@@ -445,7 +429,8 @@
         \item \texttt{uno\_websocket\_connections\_active} --- jugador vs espectador
         \item \texttt{uno\_rate\_limit\_hits} + \texttt{uno\_session\_events} --- abuso y sesión única
       \end{itemize}
-  \end{columns}
+    \end{minipage}
+  \end{center}
   \vfill
   \centering\scriptsize\color{cGrey}
   Criterio: métricas sobre \emph{el juego}, no sobre el proceso --- lo que miraría un operador de torneo.
@@ -454,15 +439,18 @@
 % ============================================================
 \begin{frame}{Demo: lo que van a ver ahora}
   \begin{enumerate}\small
-    \item \textbf{Despliegue desde cluster vacío} --- \texttt{deploy-all.sh} ($\sim$2 min):\\
-          {\scriptsize kind $\to$ 7 imágenes side-load $\to$ infra (PG, Redis $\times$2, Redpanda + tópicos) $\to$ observabilidad $\to$ 7 servicios}
-    \item \textbf{Partida casual 1v1} --- dos terminales interactivas:\\
+    \item \textbf{Despliegue desde cluster vacío} --- \texttt{deploy-all.sh} ($\sim$2 min)\\
+          {\scriptsize kind $\to$ 7 imágenes side-load $\to$ infra (PG, Redis $\times$2, Redpanda + tópicos) $\to$ observabilidad $\to$ 7 servicios;
+          \texttt{kubectl get pods -n unoarena} para verlos corriendo}
+    \item \textbf{Tres terminales} --- \texttt{register} + \texttt{login}: \alert{bob}, \alert{alice} y \alert{carol} (espectadora)\\
+          {\scriptsize una sesión por terminal: \texttt{UNOARENA\_SESSION\_FILE} distinto en cada una}
+    \item \textbf{Partida casual 1v1} --- bob y alice a la cola de matchmaking:\\
           {\scriptsize \texttt{play} / \texttt{draw} / \texttt{uno} / \texttt{challenge}, WILD con color, 409 stale + reconciliación}
-    \item \textbf{Espectador en vivo} --- tercera terminal: {\scriptsize conteos sí, manos jamás}
-    \item \textbf{Sesión única} --- segundo login cierra el WS con código 4401 (push, no polling)
-    \item \textbf{Evidencia} --- Grafana (negocio + RED), Jaeger (traza que cruza Kafka),\\
-          {\scriptsize \texttt{psql}: log inmutable y Elo que se movió}
-    \item \textbf{Torneo Bo3 con 4 bots} $\to$ campeón + Elo de torneo {\scriptsize (si el tiempo acompaña)}
+    \item \textbf{Espectadora en vivo} --- carol: \texttt{room list} $\to$ \texttt{spectate <roomId>}\\
+          {\scriptsize conteos sí, manos jamás: la ACL de privacidad se aplica al consumir el evento}
+    \item \textbf{Torneo con 20 bots} $\to$ bracket Bo3 real, campeón y Elo de torneo\\
+          {\scriptsize en Grafana: la cola de matchmaking, los eventos/s y las escrituras de Elo moviéndose en vivo}
+    \item \textbf{Teardown} --- \texttt{deploy-all.sh -{}-destroy}
   \end{enumerate}
 \end{frame}
 
